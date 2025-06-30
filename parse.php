@@ -6,21 +6,24 @@ use Symfony\Component\DomCrawler\Crawler;
 $db = new SQLite3('igrejas.db');
 $db->exec("CREATE TABLE IF NOT EXISTS igrejas (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	nome TEXT,
+	nome TEXT NOT NULL,
 	presbiterio TEXT,
 	endereco TEXT,
+	municipio TEXT,
+	uf TEXT,
 	cep TEXT,
 	tel TEXT,
 	email TEXT,
 	website TEXT,
-	municipio TEXT,
-	uf TEXT,
+	website_dado_original TEXT,
+	website_validado INTEGER DEFAULT 0,
+	website_dados_lgpd INTEGER DEFAULT 0,
 	UNIQUE(nome, presbiterio, municipio, uf) ON CONFLICT IGNORE
 )");
 
 $db->exec("CREATE TABLE IF NOT EXISTS pastores (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	nome TEXT,
+	nome TEXT NOT NULL,
 	tel TEXT,
 	cel TEXT,
 	email TEXT,
@@ -40,7 +43,6 @@ function extrairBlocosIgrejaPastor(string $html): void {
 
 	$atual = 0;
 	$igrejas = $crawler->filter('div[style^="font-family: Helvetica, Arial; background-color: rgba(0,0,0,0.05);"]');
-	$atual = 0;
 
 	// Cada bloco contém uma igreja e, opcionalmente, um pastor
 	$crawler->filter('div[style^="font-family: Helvetica, Arial; background-color: rgba(0,0,0,0.05);"]')
@@ -136,7 +138,9 @@ function parseIgreja(Crawler $divs): array {
 			$igreja['municipio'] = trim($munUf['municipio']);
 			$igreja['uf'] = trim($munUf['uf']);
 			// Remove município e UF do final do endereço
-			$igreja['endereco'] = trim(preg_replace('/\s*' . preg_quote($munUf[0], '/') . '$/', '', $igreja['endereco']));
+			$igreja['endereco'] = preg_replace('/\s*' . preg_quote($munUf[0], '/') . '$/', '', $igreja['endereco']);
+			$igreja['endereco'] = trim($igreja['endereco']);
+			$igreja['endereco'] = preg_replace('/\s*-\s*$/', '', $igreja['endereco']);
 		}
 	}
 
@@ -151,12 +155,23 @@ function parseIgreja(Crawler $divs): array {
 		if (str_starts_with($href, 'tel:')) {
 			$tel = trim(str_replace('tel:', '', $href));
 			$tel = str_replace('%20', ' ', $tel);
-			$tel = preg_replace('/[^\d\s\+\-\(\)]/', '', $tel); // mantém apenas números, espaços, +, -, ()
+			$tel = preg_replace('/[^\d\s\+\-\(\)]/', '', $tel);
 			$igreja['tel'] = $tel;
 		} elseif (str_starts_with($href, 'mailto:')) {
 			$igreja['email'] = trim(str_replace('mailto:', '', $href));
 		} elseif (str_starts_with($href, 'http') || str_starts_with($href, 'www')) {
-			$igreja['website'] = trim($href);
+			$igreja['website_dado_original'] = trim($href);
+			// Valida se é uma URL válida
+			if (
+				filter_var($igreja['website_dado_original'], FILTER_VALIDATE_URL) &&
+				!in_array($igreja['website_dado_original'], [
+					'http://yahoo.com.br/',
+					'http://xn--nopossui-rza/',
+					'http://gmail.com/',
+				])
+			) {
+				$igreja['website'] = trim($href);
+			}
 		}
 	});
 	return $igreja;
@@ -178,13 +193,13 @@ function parsePastor(Crawler $divs): ?array {
 	if (preg_match('/Tel: <a href="tel:(?<tel>[^"]+)"/m', $pastorHtml, $match)) {
 		$pastor['tel'] = $match['tel'];
 		$pastor['tel'] = str_replace('%20', ' ', $pastor['tel']);
-		$pastor['tel'] = preg_replace('/[^\d\s\+\-\(\)]/', '', $pastor['tel']); // mantém apenas números, espaços, +, -, ()
+		$pastor['tel'] = preg_replace('/[^\d\s\+\-\(\)]/', '', $pastor['tel']);
 	}
 
 	if (preg_match('/Cel: <a href="tel:(?<cel>[^"]+)"/m', $pastorHtml, $match)) {
 		$pastor['cel'] = $match['cel'];
 		$pastor['cel'] = str_replace('%20', ' ', $pastor['cel']);
-		$pastor['cel'] = preg_replace('/[^\d\s\+\-\(\)]/', '', $pastor['cel']); // mantém apenas números, espaços, +, -, ()
+		$pastor['cel'] = preg_replace('/[^\d\s\+\-\(\)]/', '', $pastor['cel']);
 	}
 
 	if (preg_match('/Email: <a href="mailto:(?<email>[^"]+)"/m', $pastorHtml, $match)) {
@@ -194,5 +209,239 @@ function parsePastor(Crawler $divs): ?array {
 	return $pastor;
 }
 
+function limparWebsitesInvalidos(SQLite3 $db): void {
+	// Remove websites inválidos por valor exato
+	$db->exec("UPDATE igrejas SET website = null WHERE website IN ('http://gmail.com/', 'http://blogspot.com/', 'http://prvv.org.br/features/igrejas')");
+
+	// Remove websites inválidos por padrão
+	$db->exec("UPDATE igrejas SET website = null WHERE website LIKE '%facebook%' OR website LIKE '%youtube%' OR website LIKE '%fb.com%' OR website LIKE '%instagram%'");
+
+	// Wix, webdnode, blogspot
+	$db->exec("UPDATE igrejas SET website_validado = 3 WHERE website like '%wixsite%' OR website like '%webnode%' OR website like '%blogspot%'");
+
+	// Não é site real, apenas um link de redirecionamento
+	$db->exec("UPDATE igrejas SET website_validado = 4 WHERE website like '%apptuts.bio' OR website like '%linkr.bio%' OR website like '%linktr.ee%'");
+
+	// 5 = Inovaki
+	// 7 = Contém dados LGPD
+}
+
+function verificarUrlEAtualizar(SQLite3 $db): void {
+	$result = $db->query("SELECT id, website FROM igrejas WHERE website IS NOT NULL AND website != ''");
+	$rows = [];
+	while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+		$rows[] = $row;
+	}
+	$total = count($rows);
+	$atual = 0;
+
+	foreach ($rows as $row) {
+		$id = $row['id'];
+		$url = $row['website'];
+
+		$ch = curl_init($url);
+		curl_setopt_array($ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_NOBODY         => true,
+			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_FOLLOWLOCATION => true,
+			CURLOPT_SSL_VERIFYPEER => false,
+		]);
+		curl_exec($ch);
+		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		$website_validado = ($httpCode >= 200 && $httpCode < 300) ? 2 : 1;
+
+		$stmt = $db->prepare("UPDATE igrejas SET website_validado = :website_validado WHERE id = :id");
+		$stmt->bindValue(':website_validado', $website_validado, SQLITE3_INTEGER);
+		$stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+		$stmt->execute();
+
+		$atual++;
+		echo "\rValidando websites: $atual de $total";
+	}
+	echo "\nValidação de websites concluída.\n";
+}
+
+function markaInovaki(SQLite3 $db): void {
+	$result = $db->query("SELECT id, website FROM igrejas WHERE website_validado = 2");
+	$rows = [];
+	while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+		$rows[] = $row;
+	}
+	$total = count($rows);
+	$atual = 0;
+	$inovaki = 0;
+
+	foreach ($rows as $row) {
+		$id = $row['id'];
+		$url = $row['website'];
+
+		$ch = curl_init($url);
+		curl_setopt_array($ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_FOLLOWLOCATION => true,
+			CURLOPT_SSL_VERIFYPEER => false,
+		]);
+		$html = curl_exec($ch);
+		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		// Se o HTML contiver 'Inovaki', define website_dados_lgpd = 'Inovaki'
+		if (stripos($html, 'Inovaki') !== false) {
+			$stmt = $db->prepare("UPDATE igrejas SET website_validado = :website_validado, website_dados_lgpd = :lgpd WHERE id = :id");
+			$stmt->bindValue(':website_validado', 5, SQLITE3_INTEGER);
+			$stmt->bindValue(':lgpd', 'Inovaki', SQLITE3_TEXT);
+			$stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+			$stmt->execute();
+			$inovaki++;
+		}
+
+		$atual++;
+		echo "\rValidando websites: $atual de $total; Inovaki: $inovaki";
+	}
+	echo "\nValidação de websites concluída.\n";
+}
+
+function marcaInChurch(SQLite3 $db): void {
+	$result = $db->query("SELECT id, website FROM igrejas WHERE website_validado = 2");
+	$rows = [];
+	while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+		$rows[] = $row;
+	}
+	$total = count($rows);
+	$atual = 0;
+	$inchurch = 0;
+
+	foreach ($rows as $row) {
+		$id = $row['id'];
+		$url = $row['website'];
+
+		$ch = curl_init($url);
+		curl_setopt_array($ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_FOLLOWLOCATION => true,
+			CURLOPT_SSL_VERIFYPEER => false,
+		]);
+		$html = curl_exec($ch);
+		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		// Se o HTML contiver 'inchurch', define website_dados_lgpd = 'inchurch'
+		if (stripos($html, 'inradar') !== false) {
+			$stmt = $db->prepare("UPDATE igrejas SET website_validado = :website_validado, website_dados_lgpd = :lgpd WHERE id = :id");
+			$stmt->bindValue(':website_validado', 5, SQLITE3_INTEGER);
+			$stmt->bindValue(':lgpd', 'inchurch', SQLITE3_TEXT);
+			$stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+			$stmt->execute();
+			$inchurch++;
+		}
+
+		$atual++;
+		echo "\rValidando websites: $atual de $total; inchurch: $inchurch";
+	}
+	echo "\nValidação de websites concluída.\n";
+}
+
+function marcaEklesia(SQLite3 $db): void {
+	$result = $db->query("SELECT id, website FROM igrejas WHERE website_validado = 2 AND website_dados_lgpd IS NULL");
+	$rows = [];
+	while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+		$rows[] = $row;
+	}
+	$total = count($rows);
+	$atual = 0;
+	$eklesia = 0;
+
+	foreach ($rows as $row) {
+		$id = $row['id'];
+		$url = $row['website'];
+
+		$ch = curl_init($url);
+		curl_setopt_array($ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_FOLLOWLOCATION => true,
+			CURLOPT_SSL_VERIFYPEER => false,
+		]);
+		$html = curl_exec($ch);
+		$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		// Se o HTML contiver 'eklesia', define website_dados_lgpd = 'eklesia'
+		if (stripos($html, 'inradar') !== false) {
+			$stmt = $db->prepare("UPDATE igrejas SET website_validado = :website_validado, website_dados_lgpd = :lgpd WHERE id = :id");
+			$stmt->bindValue(':website_validado', 5, SQLITE3_INTEGER);
+			$stmt->bindValue(':lgpd', 'eklesia', SQLITE3_TEXT);
+			$stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+			$stmt->execute();
+			$eklesia++;
+		}
+
+		$atual++;
+		echo "\rValidando websites: $atual de $total; eklesia: $eklesia";
+	}
+	echo "\nValidação de websites concluída.\n";
+}
+
+function marcaSistemaProver(SQLite3 $db): void {
+	$result = $db->query("SELECT id, website FROM igrejas WHERE website_validado = 2 AND website_dados_lgpd IS NULL");
+	$rows = [];
+	while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+		$rows[] = $row;
+	}
+	$total = count($rows);
+	$atual = 0;
+	$contador = 0;
+
+	foreach ($rows as $row) {
+		$id = $row['id'];
+		$url = $row['website'];
+
+		$ch = curl_init($url);
+		curl_setopt_array($ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_FOLLOWLOCATION => true,
+			CURLOPT_SSL_VERIFYPEER => false,
+		]);
+		$html = curl_exec($ch);
+		curl_close($ch);
+
+		// Se o HTML contiver 'siteprover', define website_dados_lgpd = 'sistema prover'
+		if (stripos($html, 'inradar') !== false) {
+			$stmt = $db->prepare("UPDATE igrejas SET website_validado = :website_validado, website_dados_lgpd = :lgpd WHERE id = :id");
+			$stmt->bindValue(':website_validado', 5, SQLITE3_INTEGER);
+			$stmt->bindValue(':lgpd', 'sistema prover', SQLITE3_TEXT);
+			$stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+			$stmt->execute();
+			$contador++;
+		}
+
+		$atual++;
+		echo "\rValidando websites: $atual de $total; prover: $contador";
+	}
+	echo "\nValidação de websites concluída.\n";
+}
+
+
 $html = file_get_contents('tmp.html');
+
 extrairBlocosIgrejaPastor($html);
+verificarUrlEAtualizar($db);
+limparWebsitesInvalidos($db);
+markaInovaki($db);
+marcaSistemaProver($db);
+marcaInChurch($db);
+marcaEklesia($db);
+
+
+// N = Não compliance com LGPD
+// PP = Política de privacidade
+// AC = Aviso de cookies
+// FDT = Formulário de direitos do titular
+// TU = Termo de uso
+// DPO = Data Protection Officer (Encarregado de Proteção de Dados)
