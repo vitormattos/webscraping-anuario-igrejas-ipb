@@ -16,19 +16,6 @@ Investigar a maturidade digital das igrejas da IPB quanto à presença de elemen
 - A coluna `website_dados_lgpd` foi enriquecida manualmente com informações sobre conformidade específica.
 - Algumas funções PHP foram criadas para auxiliar na atualização e limpeza de dados durante o processo.
 
-## 📁 Estrutura do projeto
-
-```
-.
-├── parse.php             # Script principal de extração de dados
-├── tmp.html              # HTML da listagem da IPB (não incluído no repositório)
-├── database.sqlite       # Banco gerado (não incluído por padrão)
-└── README.md             # Este arquivo
-
-```
-
-> Obs: Os arquivos `tmp.html` e `database.sqlite` não são incluídos neste repositório por conterem dados derivados que podem ser facilmente reprocessados.
-
 ## 📦 Requisitos
 
 - PHP 8.4+ com suporte a SQLite3 e DOMDocument
@@ -40,6 +27,16 @@ Investigar a maturidade digital das igrejas da IPB quanto à presença de elemen
 Os dados gerados com esse script subsidiaram a tabela presente na seção "Panorama da conformidade digital na IPB" da monografia:
 
 [*A comunhão dos santos frente aos dilemas da ética digital*](https://github.com/vitormattos/monografia-teologia)
+
+### Contar pastores com dados expostos
+
+```sql
+SELECT count(*)
+  FROM pastores p
+ WHERE tel IS NOT NULL
+    OR cel IS NOT NULL
+    OR email IS NOT NULL
+```
 
 ## ✍️ Autor
 
