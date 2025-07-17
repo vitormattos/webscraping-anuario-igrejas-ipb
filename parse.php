@@ -1,7 +1,9 @@
 <?php
 require 'vendor/autoload.php';
 
+use Symfony\Component\BrowserKit\HttpBrowser;
 use Symfony\Component\DomCrawler\Crawler;
+use Symfony\Component\HttpClient\HttpClient;
 
 $db = new SQLite3('igrejas.db');
 $db->exec("CREATE TABLE IF NOT EXISTS igrejas (
@@ -38,9 +40,7 @@ $db->exec("CREATE TABLE IF NOT EXISTS igreja_pastor (
 	FOREIGN KEY (pastor_id) REFERENCES pastores(id) ON DELETE CASCADE
 )");
 
-function extrairBlocosIgrejaPastor(string $html): void {
-	$crawler = new Crawler($html);
-
+function extrairBlocosIgrejaPastor(Crawler $crawler): void {
 	$atual = 0;
 	$igrejas = $crawler->filter('div[style^="font-family: Helvetica, Arial; background-color: rgba(0,0,0,0.05);"]');
 
@@ -427,10 +427,31 @@ function marcaSistemaProver(SQLite3 $db): void {
 	echo "\nValidação de websites concluída.\n";
 }
 
+function getHtml(): Crawler {
+	$data = [
+		'buscar' => 'anu_igrejas',
+		'tipo' => '1',
+	];
 
-$html = file_get_contents('tmp.html');
+	$options = [
+		'http' => [
+			'method'  => 'POST',
+			'content' => http_build_query($data),
+		],
+	];
 
-extrairBlocosIgrejaPastor($html);
+	$context = stream_context_create($options);
+
+	$response = file_get_contents('https://www.icalvinus.app/consulta_ipb/anuario.php', false, $context);
+
+	$crawler = new Crawler();
+	$crawler->addHtmlContent($response);
+
+	return $crawler;
+}
+
+$crawler = getHtml();
+extrairBlocosIgrejaPastor($crawler);
 verificarUrlEAtualizar($db);
 limparWebsitesInvalidos($db);
 markaInovaki($db);
